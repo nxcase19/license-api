@@ -1,5 +1,3 @@
-console.log("API_KEY loaded =", process.env.API_KEY);
-
 const express = require("express");
 const cors = require("cors");
 const { pool } = require("./db");
@@ -8,7 +6,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ Auth Middleware รองรับทั้ง x-api-key และ Authorization Bearer (อ่าน ENV แบบ runtime ทุกครั้ง)
+const API_KEY_RAW = process.env.API_KEY || "";
+// รองรับกรณีตั้งค่าใน Railway แบบเผลอใส่ "API_KEY=..." มาในค่า
+const API_KEY = API_KEY_RAW.replace(/^API_KEY\s*=\s*/i, "").trim().replace(/^"|"$/g, "");
+if (API_KEY) console.log("API_KEY loaded ✅ (len=" + API_KEY.length + ")");
+else console.log("API_KEY missing ❌");
+
+// ✅ Auth Middleware รองรับทั้ง x-api-key และ Authorization Bearer
 function auth(req, res, next) {
   const apiKeyHeader = req.headers["x-api-key"];
   const bearerHeader = req.headers["authorization"];
@@ -16,25 +20,18 @@ function auth(req, res, next) {
   let token = null;
 
   // Case 1: x-api-key
-  if (apiKeyHeader) token = String(apiKeyHeader).trim();
+  if (apiKeyHeader) {
+    token = apiKeyHeader;
+  }
 
   // Case 2: Authorization: Bearer xxx
-  if (bearerHeader && String(bearerHeader).startsWith("Bearer ")) {
-    token = String(bearerHeader).substring(7).trim();
+  if (bearerHeader && bearerHeader.startsWith("Bearer ")) {
+    token = bearerHeader.replace("Bearer ", "").trim();
   }
 
-  const realKey = process.env.API_KEY ? String(process.env.API_KEY).trim() : "";
+  if (token) token = String(token).trim();
 
-  if (!realKey) {
-    console.log("❌ API_KEY missing in ENV");
-    return res.status(500).json({ error: "Server misconfigured" });
-  }
-
-  if (!token || token !== realKey) {
-    console.log("❌ AUTH FAIL", {
-      hasToken: Boolean(token),
-      tokenPreview: token ? token.slice(0, 4) + "****" : null,
-    });
+  if (!token || token !== API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
@@ -73,9 +70,7 @@ app.post("/api/customers", auth, async (req, res) => {
 // ✅ List customers (sort by expire date)
 app.get("/api/customers", auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM customers ORDER BY expire_at ASC`
-    );
+    const result = await pool.query(`SELECT * FROM customers ORDER BY expire_at ASC`);
 
     res.json({ ok: true, rows: result.rows });
   } catch (err) {
@@ -87,4 +82,3 @@ app.get("/api/customers", auth, async (req, res) => {
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("API running on", PORT));
-
