@@ -6,153 +6,326 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---- API KEY (robust) ----
-const API_KEY_RAW = process.env.API_KEY || "";
-const API_KEY = API_KEY_RAW
-  .replace(/^API_KEY\s*=\s*/i, "")
-  .trim()
-  .replace(/^"|"$/g, "");
+// Accept both "MY_KEY" and "API_KEY=MY_KEY" (copy/paste friendly)
+const RAW_API_KEY = process.env.API_KEY || "";
+const API_KEY = RAW_API_KEY.startsWith("API_KEY=") ? RAW_API_KEY.replace("API_KEY=", "") : RAW_API_KEY;
 
+// ✅ Auth Middleware รองรับทั้ง x-api-key และ Authorization Bearer
 function auth(req, res, next) {
   const apiKeyHeader = req.headers["x-api-key"];
   const bearerHeader = req.headers["authorization"];
 
   let token = null;
 
+  // Case 1: x-api-key
   if (apiKeyHeader) token = apiKeyHeader;
+
+  // Case 2: Authorization: Bearer xxx
   if (bearerHeader && bearerHeader.startsWith("Bearer ")) {
     token = bearerHeader.replace("Bearer ", "").trim();
   }
-  if (token) token = String(token).trim();
 
-  if (!token || token !== API_KEY) {
+  if (!API_KEY || !token || token !== API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
   }
+
   next();
 }
 
-// ---- DB INIT (idempotent) ----
-async function initDb() {
-  // customers
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS customers (
-      id SERIAL PRIMARY KEY,
-      customer_name TEXT NOT NULL,
-      phone TEXT,
-      product_id TEXT NOT NULL,
-      license_key TEXT NOT NULL,
-      machine_id TEXT,
-      popup_message TEXT,
-      agent_id INT,
-      expire_at DATE,
-      issued_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // agents
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS agents (
-      id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      phone TEXT NOT NULL,
-      commission_percent INT DEFAULT 0,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // sales: commission ledger (earned)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS sales (
-      id SERIAL PRIMARY KEY,
-      customer_id INT REFERENCES customers(id) ON DELETE SET NULL,
-      agent_id INT REFERENCES agents(id) ON DELETE SET NULL,
-      sale_price NUMERIC NOT NULL,
-      commission_percent INT NOT NULL,
-      commission_amount NUMERIC NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // payouts: paid ledger
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS payouts (
-      id SERIAL PRIMARY KEY,
-      agent_id INT REFERENCES agents(id) ON DELETE CASCADE,
-      amount NUMERIC NOT NULL,
-      note TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
-    );
-  `);
-
-  // seed agent "บูม" if missing
-  const check = await pool.query(`SELECT id FROM agents WHERE name=$1 LIMIT 1`, ["บูม"]);
-  if (check.rowCount === 0) {
-    await pool.query(
-      `INSERT INTO agents(name, phone, commission_percent) VALUES($1,$2,$3)`,
-      ["บูม", "0888885588", 30]
-    );
-  }
-}
-
-// ---- Routes ----
+// ✅ Home route
 app.get("/", (req, res) => {
   res.send("License API is running ✅");
 });
 
+// ✅ Health check
 app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-// -------- Customers --------
-// Create customer record (agentId, popupMessage, machineId supported)
-app.post("/api/customers", auth, async (req, res) => {
-  try {
-    const { customerName, phone, productId, licenseKey, machineId, popupMessage, agentId, expireAt } = req.body;
+/**
+ * =========================
+ * V4.2: Agents / Broker + Popup Message
+ * =========================
+ * - customers: add popup_message + agent_id
+ * - agents: manage brokers/agents and commission/balance
+ * - sales: record sales and accrue commission to agent balance
+ * - payouts: withdraw from agent balance (history)
+ */
 
-    if (!customerName) return res.status(400).json({ error: "customerName required" });
-    if (!productId) return res.status(400).json({ error: "productId required" });
-    if (!licenseKey) return res.status(400).json({ error: "licenseKey required" });
+// ✅ Create agent
+app.post("/api/agents", auth, async (req, res) => {
+  try {
+    const { name, phone, commissionPercent } = req.body;
+
+    if (!name || String(name).trim() === "") {
+      return res.status(400).json({ error: "name is required" });
+    }
 
     const result = await pool.query(
-      `INSERT INTO customers(customer_name, phone, product_id, license_key, machine_id, popup_message, agent_id, expire_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+      `INSERT INTO agents(name, phone, commission_percent)
+       VALUES($1,$2,COALESCE($3,0))
        RETURNING id`,
-      [customerName, phone || null, productId, licenseKey, machineId || null, popupMessage || null, agentId || null, expireAt || null]
+      [String(name).trim(), phone || null, commissionPercent ?? 0]
     );
 
     res.json({ ok: true, id: result.rows[0].id });
   } catch (err) {
+    console.error("POST /api/agents error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ✅ List agents (with summary)
+app.get("/api/agents", auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, phone, commission_percent, balance, created_at
+       FROM agents
+       ORDER BY name ASC`
+    );
+    res.json({ ok: true, rows: result.rows });
+  } catch (err) {
+    console.error("GET /api/agents error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ✅ Agent report: totals + history
+app.get("/api/agents/:id/report", auth, async (req, res) => {
+  const agentId = Number(req.params.id);
+  if (!Number.isFinite(agentId)) return res.status(400).json({ error: "invalid agent id" });
+
+  try {
+    const agentRes = await pool.query(
+      `SELECT id, name, phone, commission_percent, balance, created_at
+       FROM agents
+       WHERE id = $1`,
+      [agentId]
+    );
+
+    if (agentRes.rowCount === 0) return res.status(404).json({ error: "agent not found" });
+
+    const totalsRes = await pool.query(
+      `SELECT
+         COALESCE(SUM(amount),0) AS sales_amount_total,
+         COALESCE(SUM(commission_amount),0) AS commission_total
+       FROM sales
+       WHERE agent_id = $1`,
+      [agentId]
+    );
+
+    const payoutTotalsRes = await pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS payouts_total
+       FROM payouts
+       WHERE agent_id = $1`,
+      [agentId]
+    );
+
+    const salesRes = await pool.query(
+      `SELECT s.id, s.customer_id, c.customer_name, s.amount, s.commission_percent, s.commission_amount, s.note, s.created_at
+       FROM sales s
+       LEFT JOIN customers c ON c.id = s.customer_id
+       WHERE s.agent_id = $1
+       ORDER BY s.created_at DESC
+       LIMIT 200`,
+      [agentId]
+    );
+
+    const payoutsRes = await pool.query(
+      `SELECT id, amount, note, created_at
+       FROM payouts
+       WHERE agent_id = $1
+       ORDER BY created_at DESC
+       LIMIT 200`,
+      [agentId]
+    );
+
+    res.json({
+      ok: true,
+      agent: agentRes.rows[0],
+      totals: {
+        salesAmountTotal: totalsRes.rows[0].sales_amount_total,
+        commissionTotal: totalsRes.rows[0].commission_total,
+        payoutsTotal: payoutTotalsRes.rows[0].payouts_total,
+      },
+      sales: salesRes.rows,
+      payouts: payoutsRes.rows,
+    });
+  } catch (err) {
+    console.error("GET /api/agents/:id/report error:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ✅ Record a sale (adds commission to agent.balance)
+app.post("/api/sales", auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { agentId, customerId, amount, note } = req.body;
+
+    const aId = Number(agentId);
+    const cId = customerId == null ? null : Number(customerId);
+    const amt = Number(amount);
+
+    if (!Number.isFinite(aId)) return res.status(400).json({ error: "agentId is required" });
+    if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: "amount must be > 0" });
+
+    await client.query("BEGIN");
+
+    const agentRes = await client.query(
+      `SELECT id, commission_percent
+       FROM agents
+       WHERE id = $1
+       FOR UPDATE`,
+      [aId]
+    );
+
+    if (agentRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "agent not found" });
+    }
+
+    const commissionPercent = Number(agentRes.rows[0].commission_percent) || 0;
+    const commissionAmount = (amt * commissionPercent) / 100;
+
+    const saleRes = await client.query(
+      `INSERT INTO sales(agent_id, customer_id, amount, commission_percent, commission_amount, note)
+       VALUES($1,$2,$3,$4,$5,$6)
+       RETURNING id`,
+      [aId, Number.isFinite(cId) ? cId : null, amt, commissionPercent, commissionAmount, note || null]
+    );
+
+    await client.query(
+      `UPDATE agents
+       SET balance = balance + $1
+       WHERE id = $2`,
+      [commissionAmount, aId]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true, id: saleRes.rows[0].id, commissionPercent, commissionAmount });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("POST /api/sales error:", err);
+    res.status(500).json({ error: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Payout (withdraw from agent.balance)
+app.post("/api/payouts", auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { agentId, amount, note } = req.body;
+
+    const aId = Number(agentId);
+    const amt = Number(amount);
+
+    if (!Number.isFinite(aId)) return res.status(400).json({ error: "agentId is required" });
+    if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: "amount must be > 0" });
+
+    await client.query("BEGIN");
+
+    const agentRes = await client.query(
+      `SELECT id, balance
+       FROM agents
+       WHERE id = $1
+       FOR UPDATE`,
+      [aId]
+    );
+
+    if (agentRes.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "agent not found" });
+    }
+
+    const balance = Number(agentRes.rows[0].balance) || 0;
+    if (balance < amt) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "insufficient balance" });
+    }
+
+    const payoutRes = await client.query(
+      `INSERT INTO payouts(agent_id, amount, note)
+       VALUES($1,$2,$3)
+       RETURNING id`,
+      [aId, amt, note || null]
+    );
+
+    await client.query(
+      `UPDATE agents
+       SET balance = balance - $1
+       WHERE id = $2`,
+      [amt, aId]
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true, id: payoutRes.rows[0].id });
+  } catch (err) {
+    try { await client.query("ROLLBACK"); } catch (_) {}
+    console.error("POST /api/payouts error:", err);
+    res.status(500).json({ error: "Server error" });
+  } finally {
+    client.release();
+  }
+});
+
+// ✅ Create customer record (now supports popupMessage + agentId)
+app.post("/api/customers", auth, async (req, res) => {
+  try {
+    const { customerName, phone, productId, licenseKey, machineId, expireAt, popupMessage, agentId } = req.body;
+
+    if (!customerName || !productId || !licenseKey || !expireAt) {
+      return res.status(400).json({ error: "customerName, productId, licenseKey, expireAt are required" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO customers(
+          customer_name, phone, product_id, license_key, machine_id, expire_at, popup_message, agent_id
+        )
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING id`,
+      [
+        String(customerName).trim(),
+        phone || null,
+        String(productId).trim(),
+        String(licenseKey).trim(),
+        machineId || null,
+        expireAt,
+        popupMessage || null,
+        agentId != null && agentId !== "" ? Number(agentId) : null,
+      ]
+    );
+
+    res.json({ ok: true, id: result.rows[0].id });
+  } catch (err) {
+    // Common: invalid agent_id foreign key, invalid date, etc.
     console.error("POST /api/customers error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// List customers with search + sort (join agents)
+// ✅ List customers (supports search/sort + includes agent info)
 app.get("/api/customers", auth, async (req, res) => {
   try {
-    const search = String(req.query.search || "").trim();
-    const sort = String(req.query.sort || "expire_asc");
+    const q = (req.query.q || "").toString().trim();
+    const sort = (req.query.sort || "expireAt").toString();
+    const order = (req.query.order || "asc").toString().toLowerCase() === "desc" ? "DESC" : "ASC";
 
-    let orderBy = "c.expire_at ASC NULLS LAST";
-    if (sort === "expire_desc") orderBy = "c.expire_at DESC NULLS LAST";
-    if (sort === "issued_desc") orderBy = "c.issued_at DESC";
-    if (sort === "issued_asc") orderBy = "c.issued_at ASC";
+    const sortCol =
+      sort === "issuedAt" ? "c.issued_at" :
+      sort === "customerName" ? "c.customer_name" :
+      "c.expire_at";
 
     const params = [];
     let where = "";
-    if (search) {
-      params.push(`%${search}%`);
-      where = `
-        WHERE c.customer_name ILIKE $1
-           OR COALESCE(c.phone,'') ILIKE $1
-           OR COALESCE(c.product_id,'') ILIKE $1
-           OR COALESCE(c.license_key,'') ILIKE $1
-           OR COALESCE(a.name,'') ILIKE $1
-           OR COALESCE(a.phone,'') ILIKE $1
-      `;
+    if (q) {
+      params.push(`%${q}%`);
+      where = `WHERE (c.customer_name ILIKE $1 OR c.phone ILIKE $1 OR c.license_key ILIKE $1)`;
     }
 
-    const q = `
+    const sql = `
       SELECT
         c.*,
         a.name AS agent_name,
@@ -161,11 +334,10 @@ app.get("/api/customers", auth, async (req, res) => {
       FROM customers c
       LEFT JOIN agents a ON a.id = c.agent_id
       ${where}
-      ORDER BY ${orderBy}
-      LIMIT 200
+      ORDER BY ${sortCol} ${order}
     `;
 
-    const result = await pool.query(q, params);
+    const result = await pool.query(sql, params);
     res.json({ ok: true, rows: result.rows });
   } catch (err) {
     console.error("GET /api/customers error:", err);
@@ -173,221 +345,6 @@ app.get("/api/customers", auth, async (req, res) => {
   }
 });
 
-// -------- Agents --------
-async function agentTotals(agentId = null) {
-  const where = agentId ? "WHERE a.id=$1" : "";
-  const params = agentId ? [agentId] : [];
-  const q = `
-    SELECT
-      a.id,
-      a.name,
-      a.phone,
-      a.commission_percent,
-      COALESCE(se.earned, 0) AS earned,
-      COALESCE(pa.paid, 0) AS paid,
-      (COALESCE(se.earned, 0) - COALESCE(pa.paid, 0)) AS balance
-    FROM agents a
-    LEFT JOIN (
-      SELECT agent_id, COALESCE(SUM(commission_amount),0) AS earned
-      FROM sales
-      GROUP BY agent_id
-    ) se ON se.agent_id = a.id
-    LEFT JOIN (
-      SELECT agent_id, COALESCE(SUM(amount),0) AS paid
-      FROM payouts
-      GROUP BY agent_id
-    ) pa ON pa.agent_id = a.id
-    ${where}
-    ORDER BY a.created_at ASC, a.id ASC
-  `;
-  const result = await pool.query(q, params);
-  return result.rows;
-}
-
-// list agents with totals
-app.get("/api/agents", auth, async (req, res) => {
-  try {
-    const rows = await agentTotals();
-    res.json({ ok: true, rows });
-  } catch (err) {
-    console.error("GET /api/agents error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// create agent
-app.post("/api/agents", auth, async (req, res) => {
-  try {
-    const { name, phone, commissionPercent } = req.body;
-    if (!name) return res.status(400).json({ error: "name required" });
-    if (!phone) return res.status(400).json({ error: "phone required" });
-
-    const pct = Number(commissionPercent || 0);
-    if (Number.isNaN(pct) || pct < 0 || pct > 100) {
-      return res.status(400).json({ error: "commissionPercent must be 0-100" });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO agents(name, phone, commission_percent) VALUES($1,$2,$3) RETURNING id`,
-      [name, phone, pct]
-    );
-    res.json({ ok: true, id: result.rows[0].id });
-  } catch (err) {
-    console.error("POST /api/agents error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// update agent
-app.put("/api/agents/:id", auth, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const { name, phone, commissionPercent } = req.body;
-    if (!id) return res.status(400).json({ error: "invalid id" });
-
-    const pct = commissionPercent === undefined ? null : Number(commissionPercent);
-    if (pct !== null && (Number.isNaN(pct) || pct < 0 || pct > 100)) {
-      return res.status(400).json({ error: "commissionPercent must be 0-100" });
-    }
-
-    const cur = await pool.query(`SELECT * FROM agents WHERE id=$1`, [id]);
-    if (cur.rowCount === 0) return res.status(404).json({ error: "agent not found" });
-
-    const nextName = name !== undefined ? name : cur.rows[0].name;
-    const nextPhone = phone !== undefined ? phone : cur.rows[0].phone;
-    const nextPct = pct !== null ? pct : cur.rows[0].commission_percent;
-
-    await pool.query(
-      `UPDATE agents SET name=$1, phone=$2, commission_percent=$3 WHERE id=$4`,
-      [nextName, nextPhone, nextPct, id]
-    );
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error("PUT /api/agents/:id error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// payout (deduct balance, no link to licenses)
-app.post("/api/agents/:id/payouts", auth, async (req, res) => {
-  try {
-    const agentId = Number(req.params.id);
-    const amount = Number(req.body.amount);
-    const note = String(req.body.note || "");
-
-    if (!agentId) return res.status(400).json({ error: "invalid agentId" });
-    if (!amount || amount <= 0) return res.status(400).json({ error: "amount must be > 0" });
-
-    const totals = await agentTotals(agentId);
-    if (!totals || totals.length === 0) return res.status(404).json({ error: "agent not found" });
-
-    const balance = Number(totals[0].balance || 0);
-    if (amount > balance) {
-      return res.status(400).json({ error: "amount exceeds balance" });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO payouts(agent_id, amount, note) VALUES($1,$2,$3) RETURNING id`,
-      [agentId, amount, note]
-    );
-
-    res.json({ ok: true, id: result.rows[0].id });
-  } catch (err) {
-    console.error("POST /api/agents/:id/payouts error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// agent history (sales + payouts)
-app.get("/api/agents/:id/history", auth, async (req, res) => {
-  try {
-    const agentId = Number(req.params.id);
-    if (!agentId) return res.status(400).json({ error: "invalid agentId" });
-
-    const agent = await pool.query(`SELECT * FROM agents WHERE id=$1`, [agentId]);
-    if (agent.rowCount === 0) return res.status(404).json({ error: "agent not found" });
-
-    const sales = await pool.query(
-      `
-      SELECT s.*, c.customer_name, c.product_id
-      FROM sales s
-      LEFT JOIN customers c ON c.id = s.customer_id
-      WHERE s.agent_id=$1
-      ORDER BY s.created_at DESC
-      LIMIT 500
-      `,
-      [agentId]
-    );
-
-    const payouts = await pool.query(
-      `SELECT * FROM payouts WHERE agent_id=$1 ORDER BY created_at DESC LIMIT 500`,
-      [agentId]
-    );
-
-    const totals = (await agentTotals(agentId))[0];
-
-    res.json({
-      ok: true,
-      agent: agent.rows[0],
-      totals,
-      sales: sales.rows,
-      payouts: payouts.rows,
-    });
-  } catch (err) {
-    console.error("GET /api/agents/:id/history error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// -------- Sales --------
-// create sale: compute commission from agent %
-app.post("/api/sales", auth, async (req, res) => {
-  try {
-    const customerId = Number(req.body.customerId);
-    const agentId = Number(req.body.agentId);
-    const salePrice = Number(req.body.salePrice);
-
-    if (!customerId) return res.status(400).json({ error: "customerId required" });
-    if (!agentId) return res.status(400).json({ error: "agentId required" });
-    if (!salePrice || salePrice <= 0) return res.status(400).json({ error: "salePrice must be > 0" });
-
-    const agent = await pool.query(`SELECT commission_percent FROM agents WHERE id=$1`, [agentId]);
-    if (agent.rowCount === 0) return res.status(404).json({ error: "agent not found" });
-
-    const pct = Number(agent.rows[0].commission_percent || 0);
-    const commissionAmount = (salePrice * pct) / 100;
-
-    const result = await pool.query(
-      `INSERT INTO sales(customer_id, agent_id, sale_price, commission_percent, commission_amount)
-       VALUES($1,$2,$3,$4,$5)
-       RETURNING id`,
-      [customerId, agentId, salePrice, pct, commissionAmount]
-    );
-
-    res.json({
-      ok: true,
-      id: result.rows[0].id,
-      commissionPercent: pct,
-      commissionAmount,
-    });
-  } catch (err) {
-    console.error("POST /api/sales error:", err);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ---- Start ----
+// ✅ Start server
 const PORT = process.env.PORT || 3000;
-
-initDb()
-  .then(() => {
-    console.log("DB init ✅");
-    if (API_KEY) console.log("API_KEY loaded ✅ (len=" + API_KEY.length + ")");
-    else console.log("API_KEY missing ❌");
-    app.listen(PORT, () => console.log("API running on", PORT));
-  })
-  .catch((err) => {
-    console.error("DB init failed:", err);
-    process.exit(1);
-  });
+app.listen(PORT, () => console.log("API running on", PORT));
