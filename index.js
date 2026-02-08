@@ -6,9 +6,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const API_KEY = process.env.API_KEY;
-
-// ✅ Auth Middleware รองรับทั้ง x-api-key และ Authorization Bearer
+// ✅ Auth Middleware รองรับทั้ง x-api-key และ Authorization Bearer (อ่าน ENV แบบ runtime ทุกครั้ง)
 function auth(req, res, next) {
   const apiKeyHeader = req.headers["x-api-key"];
   const bearerHeader = req.headers["authorization"];
@@ -16,16 +14,25 @@ function auth(req, res, next) {
   let token = null;
 
   // Case 1: x-api-key
-  if (apiKeyHeader) {
-    token = apiKeyHeader;
-  }
+  if (apiKeyHeader) token = String(apiKeyHeader).trim();
 
   // Case 2: Authorization: Bearer xxx
-  if (bearerHeader && bearerHeader.startsWith("Bearer ")) {
-    token = bearerHeader.replace("Bearer ", "").trim();
+  if (bearerHeader && String(bearerHeader).startsWith("Bearer ")) {
+    token = String(bearerHeader).substring(7).trim();
   }
 
-  if (!token || token !== API_KEY) {
+  const realKey = process.env.API_KEY ? String(process.env.API_KEY).trim() : "";
+
+  if (!realKey) {
+    console.log("❌ API_KEY missing in ENV");
+    return res.status(500).json({ error: "Server misconfigured" });
+  }
+
+  if (!token || token !== realKey) {
+    console.log("❌ AUTH FAIL", {
+      hasToken: Boolean(token),
+      tokenPreview: token ? token.slice(0, 4) + "****" : null,
+    });
     return res.status(401).json({ error: "Unauthorized" });
   }
 
