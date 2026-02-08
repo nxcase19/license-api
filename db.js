@@ -1,13 +1,16 @@
 const { Pool } = require("pg");
 
-// Railway แนะนำให้ใช้ DATABASE_URL
-// ตัวอย่าง: postgresql://user:pass@host:port/db
-const connectionString = process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+// Railway / cloud Postgres usually requires SSL. Local Postgres often doesn't.
+const needsSSL = !DATABASE_URL.includes("localhost") && !DATABASE_URL.includes("127.0.0.1");
 
 const pool = new Pool({
-  connectionString,
-  // Railway บางโปรเจกต์ต้องใช้ SSL; ถ้าเจอปัญหาให้เปิดด้านล่าง
-  // ssl: { rejectUnauthorized: false },
+  connectionString: DATABASE_URL,
+  ssl: needsSSL ? { rejectUnauthorized: false } : false,
 });
 
 module.exports = { pool };
