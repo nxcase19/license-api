@@ -1,3 +1,5 @@
+console.log("API_KEY loaded =", process.env.API_KEY);
+
 const express = require("express");
 const cors = require("cors");
 const { pool } = require("./db");
@@ -85,3 +87,4 @@ app.get("/api/customers", auth, async (req, res) => {
 // ✅ Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("API running on", PORT));
+
