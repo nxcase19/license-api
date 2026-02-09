@@ -44,9 +44,9 @@ app.get("/health", (req, res) => {
 
 /**
  * =========================
- * V4.2: Agents / Broker + Popup Message
+ * V4.2: Agents / Broker + Popup Message + Sales/Commission (Option A)
  * =========================
- * - customers: add popup_message + agent_id
+ * - customers: popup_message + agent_id (+ amount optional for commission)
  * - agents: manage brokers/agents and commission/balance
  * - sales: record sales and accrue commission to agent balance
  * - payouts: withdraw from agent balance (history)
@@ -75,7 +75,7 @@ app.post("/api/agents", auth, async (req, res) => {
   }
 });
 
-// ✅ List agents (with summary)
+// ✅ List agents
 app.get("/api/agents", auth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -157,7 +157,7 @@ app.get("/api/agents/:id/report", auth, async (req, res) => {
   }
 });
 
-// ✅ Record a sale (adds commission to agent.balance)
+// ✅ Record a sale (manual) - adds commission to agent.balance
 app.post("/api/sales", auth, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -271,16 +271,63 @@ app.post("/api/payouts", auth, async (req, res) => {
   }
 });
 
-// ✅ Create customer record (now supports popupMessage + agentId)
+// ✅ Create customer record
+// V4.2 (Option A): supports popupMessage + agentId + amount
+// If agentId + amount provided -> create sale + add commission to agent.balance (transaction)
 app.post("/api/customers", auth, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { customerName, phone, productId, licenseKey, machineId, expireAt, popupMessage, agentId } = req.body;
+    const {
+      customerName,
+      phone,
+      productId,
+      licenseKey,
+      machineId,
+      expireAt,
+      popupMessage,
+      agentId,
+      amount,   // ✅ NEW (Option A)
+      note,     // optional note for sale
+    } = req.body;
 
     if (!customerName || !productId || !licenseKey || !expireAt) {
       return res.status(400).json({ error: "customerName, productId, licenseKey, expireAt are required" });
     }
 
-    const result = await pool.query(
+    const aId = agentId != null && agentId !== "" ? Number(agentId) : null;
+    const amt = amount != null && amount !== "" ? Number(amount) : null;
+
+    // If amount is provided, agentId must be provided (commission system)
+    if (amt != null && (!Number.isFinite(amt) || amt <= 0)) {
+      return res.status(400).json({ error: "amount must be > 0" });
+    }
+    if (amt != null && !Number.isFinite(aId)) {
+      return res.status(400).json({ error: "agentId is required when amount is provided" });
+    }
+
+    await client.query("BEGIN");
+
+    // If agentId provided, verify agent exists (better error than FK fail)
+    let commissionPercent = 0;
+    let commissionAmount = 0;
+    if (Number.isFinite(aId)) {
+      const agentRes = await client.query(
+        `SELECT id, commission_percent
+         FROM agents
+         WHERE id = $1
+         FOR UPDATE`,
+        [aId]
+      );
+      if (agentRes.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "agent not found" });
+      }
+      commissionPercent = Number(agentRes.rows[0].commission_percent) || 0;
+      if (amt != null) commissionAmount = (amt * commissionPercent) / 100;
+    }
+
+    // Insert customer
+    const custRes = await client.query(
       `INSERT INTO customers(
           customer_name, phone, product_id, license_key, machine_id, expire_at, popup_message, agent_id
         )
@@ -294,15 +341,46 @@ app.post("/api/customers", auth, async (req, res) => {
         machineId || null,
         expireAt,
         popupMessage || null,
-        agentId != null && agentId !== "" ? Number(agentId) : null,
+        Number.isFinite(aId) ? aId : null,
       ]
     );
 
-    res.json({ ok: true, id: result.rows[0].id });
+    const customerId = custRes.rows[0].id;
+
+    // If amount provided -> create sale + update balance
+    let saleId = null;
+    if (amt != null && Number.isFinite(aId)) {
+      const saleRes = await client.query(
+        `INSERT INTO sales(agent_id, customer_id, amount, commission_percent, commission_amount, note)
+         VALUES($1,$2,$3,$4,$5,$6)
+         RETURNING id`,
+        [aId, customerId, amt, commissionPercent, commissionAmount, note || null]
+      );
+      saleId = saleRes.rows[0].id;
+
+      await client.query(
+        `UPDATE agents
+         SET balance = balance + $1
+         WHERE id = $2`,
+        [commissionAmount, aId]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    res.json({
+      ok: true,
+      id: customerId,
+      saleId,
+      commissionPercent,
+      commissionAmount,
+    });
   } catch (err) {
-    // Common: invalid agent_id foreign key, invalid date, etc.
+    try { await client.query("ROLLBACK"); } catch (_) {}
     console.error("POST /api/customers error:", err);
     res.status(500).json({ error: "Server error" });
+  } finally {
+    client.release();
   }
 });
 
