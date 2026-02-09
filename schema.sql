@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS sales (
   id SERIAL PRIMARY KEY,
   agent_id INT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   customer_id INT REFERENCES customers(id) ON DELETE SET NULL,
-  amount NUMERIC NOT NULL,
+  sale_price NUMERIC NOT NULL,
   commission_percent NUMERIC NOT NULL,
   commission_amount NUMERIC NOT NULL,
   note TEXT,
@@ -51,5 +51,4 @@ CREATE TABLE IF NOT EXISTS payouts (
 CREATE INDEX IF NOT EXISTS idx_payouts_agent_id_created_at ON payouts(agent_id, created_at);
 
 -- Optional: seed initial agent "บูม"
--- INSERT INTO agents(name, phone, commission_percent) VALUES('บูม', '0888885588', 0)
--- ON CONFLICT DO NOTHING;
+-- INSERT INTO agents(name, phone, commission_percent) VALUES('บูม', '0888885588', 0);
