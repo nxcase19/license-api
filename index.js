@@ -55,10 +55,6 @@ app.get("/health", (req, res) => {
  * - payouts: withdraw from agent balance (history)
  */
 
-// =======================================================
-// ✅ AGENTS
-// =======================================================
-
 // ✅ Create agent
 app.post("/api/agents", auth, async (req, res) => {
   try {
@@ -77,7 +73,7 @@ app.post("/api/agents", auth, async (req, res) => {
 
     res.json({ ok: true, id: result.rows[0].id });
   } catch (err) {
-    console.error("POST /api/agents error:", err?.message || err);
+    console.error("POST /api/agents error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -90,15 +86,14 @@ app.get("/api/agents", auth, async (req, res) => {
        FROM agents
        ORDER BY name ASC`
     );
-
     res.json({ ok: true, rows: result.rows });
   } catch (err) {
-    console.error("GET /api/agents error:", err?.message || err);
+    console.error("GET /api/agents error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// ✅ Agent report: totals + history
+// ✅ Agent report
 app.get("/api/agents/:id/report", auth, async (req, res) => {
   const agentId = Number(req.params.id);
   if (!Number.isFinite(agentId))
@@ -164,19 +159,14 @@ app.get("/api/agents/:id/report", auth, async (req, res) => {
       payouts: payoutsRes.rows,
     });
   } catch (err) {
-    console.error("GET /api/agents/:id/report error:", err?.message || err);
+    console.error("GET /api/agents/:id/report error:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// =======================================================
-// ✅ SALES (FIXED 100%)
-// =======================================================
-
-// ✅ Record a sale (adds commission to agent.balance)
+// ✅ Record a sale (FIXED: amount)
 app.post("/api/sales", auth, async (req, res) => {
   const client = await pool.connect();
-
   try {
     const { agentId, customerId, amount, note } = req.body;
 
@@ -186,13 +176,11 @@ app.post("/api/sales", auth, async (req, res) => {
 
     if (!Number.isFinite(aId))
       return res.status(400).json({ error: "agentId is required" });
-
     if (!Number.isFinite(amt) || amt <= 0)
       return res.status(400).json({ error: "amount must be > 0" });
 
     await client.query("BEGIN");
 
-    // lock agent row
     const agentRes = await client.query(
       `SELECT id, commission_percent
        FROM agents
@@ -208,12 +196,12 @@ app.post("/api/sales", auth, async (req, res) => {
 
     const commissionPercent =
       Number(agentRes.rows[0].commission_percent) || 0;
-
     const commissionAmount = (amt * commissionPercent) / 100;
 
-    // ✅ Insert into sales (amount column)
+    // ✅ FIXED: insert into amount (not sale_price)
     const saleRes = await client.query(
-      `INSERT INTO sales(agent_id, customer_id, amount, commission_percent, commission_amount, note)
+      `INSERT INTO sales(agent_id, customer_id, amount,
+                        commission_percent, commission_amount, note)
        VALUES($1,$2,$3,$4,$5,$6)
        RETURNING id`,
       [
@@ -226,7 +214,6 @@ app.post("/api/sales", auth, async (req, res) => {
       ]
     );
 
-    // update agent balance
     await client.query(
       `UPDATE agents
        SET balance = balance + $1
@@ -248,20 +235,17 @@ app.post("/api/sales", auth, async (req, res) => {
     } catch (_) {}
 
     console.error("POST /api/sales error:", err?.message || err);
+    if (err?.stack) console.error(err.stack);
+
     res.status(500).json({ error: "Server error" });
   } finally {
     client.release();
   }
 });
 
-// =======================================================
-// ✅ PAYOUTS
-// =======================================================
-
-// ✅ Withdraw from agent.balance
+// ✅ Payout
 app.post("/api/payouts", auth, async (req, res) => {
   const client = await pool.connect();
-
   try {
     const { agentId, amount, note } = req.body;
 
@@ -270,7 +254,6 @@ app.post("/api/payouts", auth, async (req, res) => {
 
     if (!Number.isFinite(aId))
       return res.status(400).json({ error: "agentId is required" });
-
     if (!Number.isFinite(amt) || amt <= 0)
       return res.status(400).json({ error: "amount must be > 0" });
 
@@ -310,7 +293,6 @@ app.post("/api/payouts", auth, async (req, res) => {
     );
 
     await client.query("COMMIT");
-
     res.json({ ok: true, id: payoutRes.rows[0].id });
   } catch (err) {
     try {
@@ -318,17 +300,15 @@ app.post("/api/payouts", auth, async (req, res) => {
     } catch (_) {}
 
     console.error("POST /api/payouts error:", err?.message || err);
+    if (err?.stack) console.error(err.stack);
+
     res.status(500).json({ error: "Server error" });
   } finally {
     client.release();
   }
 });
 
-// =======================================================
-// ✅ CUSTOMERS
-// =======================================================
-
-// ✅ Create customer record (popupMessage + agentId)
+// ✅ Create customer record
 app.post("/api/customers", auth, async (req, res) => {
   try {
     const {
@@ -370,14 +350,25 @@ app.post("/api/customers", auth, async (req, res) => {
     res.json({ ok: true, id: result.rows[0].id });
   } catch (err) {
     console.error("POST /api/customers error:", err?.message || err);
+    if (err?.stack) console.error(err.stack);
+
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// ✅ List customers (includes agent info)
+// ✅ List customers
 app.get("/api/customers", auth, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const q = (req.query.q || "").toString().trim();
+
+    const params = [];
+    let where = "";
+    if (q) {
+      params.push(`%${q}%`);
+      where = `WHERE (c.customer_name ILIKE $1 OR c.phone ILIKE $1 OR c.license_key ILIKE $1)`;
+    }
+
+    const sql = `
       SELECT
         c.*,
         a.name AS agent_name,
@@ -385,19 +376,20 @@ app.get("/api/customers", auth, async (req, res) => {
         a.commission_percent AS agent_commission_percent
       FROM customers c
       LEFT JOIN agents a ON a.id = c.agent_id
+      ${where}
       ORDER BY c.expire_at ASC
-    `);
+    `;
 
+    const result = await pool.query(sql, params);
     res.json({ ok: true, rows: result.rows });
   } catch (err) {
     console.error("GET /api/customers error:", err?.message || err);
+    if (err?.stack) console.error(err.stack);
+
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// =======================================================
-// ✅ START SERVER
-// =======================================================
-
+// ✅ Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("API running on", PORT));
